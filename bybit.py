@@ -404,7 +404,7 @@ def turtle_trading_bot():
         except Exception as e:
             logger.error("Error in multi-symbol loop: {}", e)
             log_trade("bot_error", str(e))
-        time.sleep(60)
+        time.sleep(10 * 60)
 
 if __name__ == '__main__':
     turtle_trading_bot()

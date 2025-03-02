@@ -3,3 +3,4 @@ config.json
 .DS_store
 plot_signals*
 historical_data.json
+signals*

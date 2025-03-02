@@ -1,3 +1,5 @@
+import argparse
+import sys
 import time
 import datetime
 import json
@@ -12,7 +14,8 @@ from loguru import logger
 # ------------------- CONFIGURATION -------------------
 # Ensure config.json contains {"api_key": "...", "api_secret": "..."}
 INTERVAL = 'D'              # Daily candles
-HIST_LIMIT = 200            # Number of historical bars to fetch
+HIST_LIMIT = 200            # Number of historical bars to fetch (for live trading)
+BACKTEST_LIMIT = 1000       # Number of bars for backtesting (if available)
 RISK_PERCENT = 0.02         # Risk 2% of equity per trade
 RECV_WINDOW = 5000          # Recv window in ms
 
@@ -21,38 +24,35 @@ RSI_LONG_THRESHOLD = 50
 RSI_SHORT_THRESHOLD = 50
 FIXED_ATR_PERCENT_THRESHOLD = 0.005  # 0.5% of price
 
-# Partial exit ratio (percentage of position to exit on exit signal)
+# Partial exit ratio: fraction of position to exit on exit signal
 PARTIAL_EXIT_RATIO = 0.5
 
-# Pyramid parameters (as in previous versions)
-PYRAMID_THRESHOLD = 0.03      # 3% favorable move to add on
-PYRAMID_MAX_COUNT = 3         # Maximum pyramid additions per position
+# Pyramid parameters
+PYRAMID_THRESHOLD = 0.03      # 3% favorable move required to add on
+PYRAMID_MAX_COUNT = 3         # Maximum additional orders per position
 PYRAMID_ORDER_FACTOR = 0.5    # Additional order is 50% of base risk-based order size
 
-# Volume filter parameters (if used)
-VOL_PERIOD = 20                 
-VOL_MULTIPLIER = 1.2            
+# Volume filter parameters (if desired)
+VOL_PERIOD = 20                 # Volume moving average period
+VOL_MULTIPLIER = 1.2            # Current volume must exceed 1.2x its 20-day average
 
 # Symbols to trade (USDT perpetual futures)
 SYMBOLS = [
     "XLMUSDT",
     "BTCUSDT",
     "SOLUSDT",
+    "XRPUSDT",
     "ETHUSDT"
 ]
 # -----------------------------------------------------
 
-logger.add("bot_debug.log", level="DEBUG", rotation="1 MB")
-
-# Global dictionary to track pyramid data per symbol
+# Global dictionaries for pyramid data and analytics
 pyramid_data = {}
-
-# Global analytics dictionary to track trade performance
 analytics = {
     "total_trades": 0,
     "winning_trades": 0,
     "losing_trades": 0,
-    "total_profit": 0.0  # profit in USDT (or relative units)
+    "total_profit": 0.0
 }
 
 # ------------------- RETRY WRAPPER -------------------
@@ -61,7 +61,7 @@ def retry_request(func, *args, retries=3, delay=2, **kwargs):
         try:
             return func(*args, **kwargs)
         except Exception as e:
-            logger.warning("Error calling {}: {}. Retry {}/{}".format(func.__name__, e, i+1, retries))
+            logger.warning("Error in {}: {}. Retry {}/{}".format(func.__name__, e, i+1, retries))
             time.sleep(delay * (2 ** i))
     raise Exception("Function {} failed after {} retries.".format(func.__name__, retries))
 
@@ -108,8 +108,8 @@ def get_historical_klines(symbol, interval, limit=HIST_LIMIT):
 def compute_atr(df, period=14):
     df['prev_close'] = df['close'].shift(1)
     df['tr'] = df.apply(lambda row: max(row['high'] - row['low'],
-                                        abs(row['high'] - row['prev_close']),
-                                        abs(row['low'] - row['prev_close'])), axis=1)
+                                          abs(row['high'] - row['prev_close']),
+                                          abs(row['low'] - row['prev_close'])), axis=1)
     df['atr'] = df['tr'].rolling(window=period).mean()
     df.drop(['prev_close', 'tr'], axis=1, inplace=True)
     return df
@@ -253,19 +253,8 @@ def close_position(symbol, qty):
     logger.debug("Closing position on {}: qty={}", symbol, qty)
     return place_order(symbol, side="Sell", order_type="Market", qty=qty, reduce_only=True)
 
-# Global analytics dictionary to track trade performance
-analytics = {
-    "total_trades": 0,
-    "winning_trades": 0,
-    "losing_trades": 0,
-    "total_profit": 0.0
-}
-
+# ------------------- ANALYTICS FUNCTIONS -------------------
 def record_trade(symbol, direction, entry_price, exit_price, qty):
-    """Record a closed trade and update analytics.
-       For long trades, profit = (exit - entry)*qty.
-       For short trades, profit = (entry - exit)*qty.
-    """
     profit = (exit_price - entry_price) * qty if direction == "long" else (entry_price - exit_price) * qty
     analytics["total_trades"] += 1
     if profit > 0:
@@ -286,6 +275,7 @@ def log_analytics():
     logger.info("[Analytics] Total Trades: {}, Wins: {}, Losses: {}, Win Rate: {:.2f}%, Total Profit: {:.2f}, Average Profit: {:.2f}",
                 analytics["total_trades"], analytics["winning_trades"], analytics["losing_trades"], win_rate, analytics["total_profit"], avg_profit)
 
+# ------------------- PLOTTING FUNCTION -------------------
 def plot_signals(df, symbol):
     plt.figure(figsize=(12, 6))
     plt.plot(df['open_time'], df['close'], label='Close Price', color='black', linewidth=1)
@@ -317,6 +307,73 @@ def plot_signals(df, symbol):
     plt.close()
     logger.info("Plot saved to {}", filename)
 
+# ------------------- BACKTESTING FUNCTION -------------------
+def backtest_symbol(symbol):
+    logger.info("Starting backtest for {}", symbol)
+    # Use a longer historical period for backtesting
+    df = get_historical_klines(symbol, INTERVAL, limit=BACKTEST_LIMIT)
+    df = calculate_turtle_signals(df)
+    
+    position = None
+    trades = []
+    
+    # Iterate over historical data row-by-row (chronologically)
+    for idx, row in df.iterrows():
+        # Long position simulation
+        if position is None:
+            if row['long_entry'] and row['rsi'] > RSI_LONG_THRESHOLD and (row['atr']/row['close'] > FIXED_ATR_PERCENT_THRESHOLD):
+                position = {
+                    'direction': 'long',
+                    'entry_price': row['close'],
+                    'entry_time': row['open_time'],
+                    'qty': 100 / row['close']
+                }
+        else:
+            if position['direction'] == 'long' and row['long_exit']:
+                trade = {
+                    'direction': 'long',
+                    'entry_price': position['entry_price'],
+                    'exit_price': row['close'],
+                    'entry_time': position['entry_time'],
+                    'exit_time': row['open_time'],
+                    'profit': (row['close'] - position['entry_price']) * position['qty']
+                }
+                trades.append(trade)
+                position = None
+
+        # Short position simulation
+        if position is None:
+            if row['short_entry'] and row['rsi'] < RSI_SHORT_THRESHOLD and (row['atr']/row['close'] > FIXED_ATR_PERCENT_THRESHOLD):
+                position = {
+                    'direction': 'short',
+                    'entry_price': row['close'],
+                    'entry_time': row['open_time'],
+                    'qty': 100 / row['close']
+                }
+        else:
+            if position['direction'] == 'short' and row['short_exit']:
+                trade = {
+                    'direction': 'short',
+                    'entry_price': position['entry_price'],
+                    'exit_price': row['close'],
+                    'entry_time': position['entry_time'],
+                    'exit_time': row['open_time'],
+                    'profit': (position['entry_price'] - row['close']) * position['qty']
+                }
+                trades.append(trade)
+                position = None
+
+    total_trades = len(trades)
+    total_profit = sum([trade['profit'] for trade in trades])
+    wins = [trade for trade in trades if trade['profit'] > 0]
+    win_rate = (len(wins) / total_trades * 100) if total_trades > 0 else 0
+    avg_profit = total_profit / total_trades if total_trades > 0 else 0
+
+    logger.info("[Backtest] {}: Total Trades: {}, Win Rate: {:.2f}%, Total Profit: {:.2f}, Average Profit: {:.2f}".format(
+        symbol, total_trades, win_rate, total_profit, avg_profit))
+    return trades
+
+# ------------------- LIVE TRADING FUNCTION -------------------
 def trade_symbol(symbol):
     df = get_historical_klines(symbol, INTERVAL, limit=HIST_LIMIT)
     df = calculate_turtle_signals(df)
@@ -338,19 +395,18 @@ def trade_symbol(symbol):
     current_price = get_latest_price(symbol)
     equity = get_wallet_equity()
     atr_percent = (current_candle['atr'] / current_candle['close']) if current_candle['close'] != 0 else 0.0
-    
+
     # Adaptive ATR threshold: average ATR% over last 14 bars vs. fixed threshold
     recent_atr_percent = df.iloc[-14:]['atr'].mean() / df.iloc[-14:]['close'].mean()
     adaptive_atr_threshold = max(FIXED_ATR_PERCENT_THRESHOLD, recent_atr_percent)
     
-    logger.info("[{}] {} | Price: {} | Equity: {} | ATR%: {:.2%} (Adaptive Threshold: {:.2%}) | RSI: {:.2f}",
+    logger.info("[{}] {} | Price: {} | Equity: {} | ATR%: {:.2%} (Adaptive: {:.2%}) | RSI: {:.2f}",
                 symbol, datetime.datetime.now(datetime.timezone.utc).isoformat(),
                 current_price, equity, atr_percent, adaptive_atr_threshold, current_candle['rsi'])
     
     position = get_current_position(symbol)
     
     if position is None:
-        # No open position; reset pyramid data if exists
         if symbol in pyramid_data:
             del pyramid_data[symbol]
         if (current_candle['long_entry'] and
@@ -389,12 +445,15 @@ def trade_symbol(symbol):
         pos_side = position.get("side", "")
         entry_price = float(position["entry_price"])
         pos_qty = float(position["size"])
-        # Initialize pyramid data if not present
         if symbol not in pyramid_data:
             pyramid_data[symbol] = {'baseline': entry_price, 'count': 0}
         if pos_side == "Buy":
-            # Pyramid logic for long positions
-            if current_price > pyramid_data[symbol]['baseline'] * (1 + PYRAMID_THRESHOLD) and pyramid_data[symbol]['count'] < PYRAMID_MAX_COUNT:
+            if current_candle['long_exit']:
+                logger.info("[{}] Long exit signal triggered. Executing partial exit.", symbol)
+                exit_qty = pos_qty * PARTIAL_EXIT_RATIO
+                close_position(symbol, qty=exit_qty)
+                record_trade(symbol, "long", entry_price, current_price, exit_qty)
+            elif current_price > pyramid_data[symbol]['baseline'] * (1 + PYRAMID_THRESHOLD) and pyramid_data[symbol]['count'] < PYRAMID_MAX_COUNT:
                 additional_size = calculate_position_size(current_price, current_candle['prev_10d_low'], equity) * PYRAMID_ORDER_FACTOR
                 if additional_size > 0:
                     logger.info("[{}] Pyramid condition met for LONG. Adding additional order of size: {}", symbol, additional_size)
@@ -402,20 +461,18 @@ def trade_symbol(symbol):
                     if order_resp:
                         pyramid_data[symbol]['baseline'] = current_price
                         pyramid_data[symbol]['count'] += 1
-            # Partial exit for long positions
-            if current_candle['long_exit']:
-                logger.info("[{}] Long exit signal triggered. Executing partial exit.", symbol)
-                exit_qty = pos_qty * PARTIAL_EXIT_RATIO
-                close_position(symbol, qty=exit_qty)
-                record_trade(symbol, "long", entry_price, current_price, exit_qty)
             elif current_price > entry_price * 1.05:
                 new_sl = round(current_price * 0.98, 4)
                 update_trailing_stop(symbol, new_stop_loss=new_sl)
             else:
                 logger.info("[{}] Long position: no exit or trailing update triggered.", symbol)
         elif pos_side == "Sell":
-            # Pyramid logic for short positions
-            if current_price < pyramid_data[symbol]['baseline'] * (1 - PYRAMID_THRESHOLD) and pyramid_data[symbol]['count'] < PYRAMID_MAX_COUNT:
+            if current_candle['short_exit']:
+                logger.info("[{}] Short exit signal triggered. Executing partial exit.", symbol)
+                exit_qty = pos_qty * PARTIAL_EXIT_RATIO
+                close_position(symbol, qty=exit_qty)
+                record_trade(symbol, "short", entry_price, current_price, exit_qty)
+            elif current_price < pyramid_data[symbol]['baseline'] * (1 - PYRAMID_THRESHOLD) and pyramid_data[symbol]['count'] < PYRAMID_MAX_COUNT:
                 additional_size = calculate_position_size(current_price, current_candle['prev_10d_high'], equity) * PYRAMID_ORDER_FACTOR
                 if additional_size > 0:
                     logger.info("[{}] Pyramid condition met for SHORT. Adding additional order of size: {}", symbol, additional_size)
@@ -423,12 +480,6 @@ def trade_symbol(symbol):
                     if order_resp:
                         pyramid_data[symbol]['baseline'] = current_price
                         pyramid_data[symbol]['count'] += 1
-            # Partial exit for short positions
-            if current_candle['short_exit']:
-                logger.info("[{}] Short exit signal triggered. Executing partial exit.", symbol)
-                exit_qty = pos_qty * PARTIAL_EXIT_RATIO
-                close_position(symbol, qty=exit_qty)
-                record_trade(symbol, "short", entry_price, current_price, exit_qty)
             elif current_price < entry_price * 0.95:
                 new_sl = round(current_price * 1.02, 4)
                 update_trailing_stop(symbol, new_stop_loss=new_sl)
@@ -450,5 +501,33 @@ def turtle_trading_bot():
             log_trade("bot_error", str(e))
         time.sleep(60)
 
+def backtest():
+    # Run backtesting for each symbol
+    for sym in SYMBOLS:
+        backtest_symbol(sym)
+        time.sleep(2)
+    log_analytics()
+
 if __name__ == '__main__':
-    turtle_trading_bot()
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(description="Trading Strategy Script with Verbose Logging Option")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug/verbose logging")
+    parser.add_argument("backtest", action="store", help="Enable backtest")
+    args = parser.parse_args()
+
+    # Configure logging level based on the verbose flag.
+    # Remove the default Loguru handler and configure output to stderr.
+    logger.remove()
+    logger.add("bot_debug.log", level="DEBUG", rotation="1 MB")
+    if args.verbose:
+        logger.add(sys.stderr, level="DEBUG")
+        logger.debug("Verbose logging enabled.")
+    else:
+        logger.add(sys.stderr, level="INFO")
+        logger.info("Standard logging enabled.")
+
+    # If run with argument "backtest", execute backtesting mode.
+    if args.backtest:
+        backtest()
+    else:
+        turtle_trading_bot()

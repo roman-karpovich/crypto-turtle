@@ -27,6 +27,7 @@ SYMBOLS = [
     "XLMUSDT",
     "BTCUSDT",
     "SOLUSDT",
+    "XRPUSDT",
     "ETHUSDT"
 ]
 # -----------------------------------------------------
@@ -272,10 +273,10 @@ def close_position(symbol, qty):
 
 def plot_signals(df, symbol):
     """
-    Plot the historical close price with Donchian channels and markers for signals.
+    Plot historical close prices with Donchian channel levels and markers for signals.
+    Exit signals are drawn first, then entry signals on top.
     Saves the plot as "plot_signals_{symbol}.png".
     """
-    # Data is already in chronological order.
     plt.figure(figsize=(12, 6))
     plt.plot(df['open_time'], df['close'], label='Close Price', color='black', linewidth=1)
     plt.plot(df['open_time'], df['prev_20d_high'], label='Prev 20d High', color='green', linestyle='--')
@@ -283,16 +284,18 @@ def plot_signals(df, symbol):
     plt.plot(df['open_time'], df['prev_10d_high'], label='Prev 10d High', color='orange', linestyle=':')
     plt.plot(df['open_time'], df['prev_10d_low'], label='Prev 10d Low', color='blue', linestyle=':')
 
-    # Mark signals
-    long_entries = df[df['long_entry'] == True]
-    long_exits = df[df['long_exit'] == True]
-    short_entries = df[df['short_entry'] == True]
-    short_exits = df[df['short_exit'] == True]
-
-    plt.scatter(long_exits['open_time'], long_exits['close'], marker='v', color='red', s=100, label='Long Exit')
-    plt.scatter(short_exits['open_time'], short_exits['close'], marker='^', color='orange', s=100, label='Short Exit')
-    plt.scatter(short_entries['open_time'], short_entries['close'], marker='v', color='blue', s=100, label='Short Entry')
-    plt.scatter(long_entries['open_time'], long_entries['close'], marker='^', color='green', s=100, label='Long Entry')
+    # Draw exit signals first
+    plt.scatter(df[df['long_exit']]['open_time'], df[df['long_exit']]['close'],
+                marker='v', color='red', s=100, label='Long Exit')
+    plt.scatter(df[df['short_exit']]['open_time'], df[df['short_exit']]['close'] * 0.99,
+                marker='^', color='orange', s=100, label='Short Exit')
+    
+    # Draw entry signals on top, with a slight vertical offset for short entry signals
+    plt.scatter(df[df['long_entry']]['open_time'], df[df['long_entry']]['close'],
+                marker='^', color='green', s=100, label='Long Entry')
+    # Apply a small offset (subtract 2% of the price) for short entry markers
+    plt.scatter(df[df['short_entry']]['open_time'], df[df['short_entry']]['close'] * 0.99,
+                marker='v', color='blue', s=100, label='Short Entry')
 
     plt.title(f"Historical Signals for {symbol}")
     plt.xlabel("Date")

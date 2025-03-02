@@ -21,17 +21,17 @@ RSI_LONG_THRESHOLD = 50
 RSI_SHORT_THRESHOLD = 50
 FIXED_ATR_PERCENT_THRESHOLD = 0.005  # 0.5% of price
 
-# Pyramid parameters
-PYRAMID_THRESHOLD = 0.03      # 3% favorable move required to add on
-PYRAMID_MAX_COUNT = 3         # Maximum additional orders allowed
-PYRAMID_ORDER_FACTOR = 0.5    # Additional order is 50% of the base risk-based order size
-
-# Partial exit ratio (fraction of position to exit on an exit signal)
+# Partial exit ratio (percentage of position to exit on exit signal)
 PARTIAL_EXIT_RATIO = 0.5
 
-# Volume filter parameters (optional)
-VOL_PERIOD = 20                 # Volume moving average period
-VOL_MULTIPLIER = 1.2            # Current volume must exceed 1.2x its 20-day average
+# Pyramid parameters (as in previous versions)
+PYRAMID_THRESHOLD = 0.03      # 3% favorable move to add on
+PYRAMID_MAX_COUNT = 3         # Maximum pyramid additions per position
+PYRAMID_ORDER_FACTOR = 0.5    # Additional order is 50% of base risk-based order size
+
+# Volume filter parameters (if used)
+VOL_PERIOD = 20                 
+VOL_MULTIPLIER = 1.2            
 
 # Symbols to trade (USDT perpetual futures)
 SYMBOLS = [
@@ -44,24 +44,34 @@ SYMBOLS = [
 
 logger.add("bot_debug.log", level="DEBUG", rotation="1 MB")
 
-# Global dictionary to store pyramid info per symbol
+# Global dictionary to track pyramid data per symbol
 pyramid_data = {}
 
-# Load API credentials from config.json
-with open('config.json') as f:
-    config = json.load(f)
-API_KEY = config['api_key']
-API_SECRET = config['api_secret']
+# Global analytics dictionary to track trade performance
+analytics = {
+    "total_trades": 0,
+    "winning_trades": 0,
+    "losing_trades": 0,
+    "total_profit": 0.0  # profit in USDT (or relative units)
+}
 
-trading_session = TradingHTTP(testnet=False, api_key=API_KEY, api_secret=API_SECRET)
+# ------------------- RETRY WRAPPER -------------------
+def retry_request(func, *args, retries=3, delay=2, **kwargs):
+    for i in range(retries):
+        try:
+            return func(*args, **kwargs)
+        except Exception as e:
+            logger.warning("Error calling {}: {}. Retry {}/{}".format(func.__name__, e, i+1, retries))
+            time.sleep(delay * (2 ** i))
+    raise Exception("Function {} failed after {} retries.".format(func.__name__, retries))
 
+# ------------------- API FUNCTIONS -------------------
 def sign_request(params, api_secret):
     sorted_params = sorted(params.items())
     param_str = '&'.join(f"{k}={v}" for k, v in sorted_params)
-    signature = hmac.new(api_secret.encode('utf-8'),
-                         param_str.encode('utf-8'),
-                         hashlib.sha256).hexdigest()
-    return signature
+    return hmac.new(api_secret.encode('utf-8'),
+                    param_str.encode('utf-8'),
+                    hashlib.sha256).hexdigest()
 
 def check_response(response):
     ret_code = response.get("ret_code", response.get("retCode", None))
@@ -78,7 +88,7 @@ def get_historical_klines(symbol, interval, limit=HIST_LIMIT):
     url = "https://api.bybit.com/v5/market/kline"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
     logger.debug("Requesting historical klines for {} with params: {}", symbol, params)
-    response = requests.get(url, params=params).json()
+    response = retry_request(requests.get, url, params=params).json()
     check_response(response)
     data = response["result"]["list"]
     logger.debug("Historical klines raw data for {}: {}", symbol, data)
@@ -90,7 +100,6 @@ def get_historical_klines(symbol, interval, limit=HIST_LIMIT):
     df["open_time"] = pd.to_datetime(pd.to_numeric(df["open_time"]), unit='ms')
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col], errors='coerce')
-    # Sort in chronological order (oldest first)
     df.sort_values("open_time", inplace=True)
     df.reset_index(drop=True, inplace=True)
     logger.debug("Historical klines dataframe for {} (chronological):\n{}", symbol, df.head())
@@ -99,8 +108,8 @@ def get_historical_klines(symbol, interval, limit=HIST_LIMIT):
 def compute_atr(df, period=14):
     df['prev_close'] = df['close'].shift(1)
     df['tr'] = df.apply(lambda row: max(row['high'] - row['low'],
-                                          abs(row['high'] - row['prev_close']),
-                                          abs(row['low'] - row['prev_close'])), axis=1)
+                                        abs(row['high'] - row['prev_close']),
+                                        abs(row['low'] - row['prev_close'])), axis=1)
     df['atr'] = df['tr'].rolling(window=period).mean()
     df.drop(['prev_close', 'tr'], axis=1, inplace=True)
     return df
@@ -116,7 +125,6 @@ def compute_rsi(df, period=14):
     return df
 
 def calculate_turtle_signals(df):
-    # Donchian channels
     df['20d_high'] = df['high'].rolling(window=20).max()
     df['20d_low']  = df['low'].rolling(window=20).min()
     df['10d_high'] = df['high'].rolling(window=10).max()
@@ -134,14 +142,13 @@ def calculate_turtle_signals(df):
     df = compute_atr(df.copy(), period=14)
     df = compute_rsi(df.copy(), period=14)
     
-    # Volume confirmation (if used)
     df['vol_avg'] = df['volume'].rolling(window=VOL_PERIOD).mean()
     df['vol_confirm'] = df['volume'] > (VOL_MULTIPLIER * df['vol_avg'])
     
     return df
 
 def get_wallet_equity():
-    response = trading_session.get_wallet_balance(coin="USDT", accountType="UNIFIED")
+    response = retry_request(trading_session.get_wallet_balance, coin="USDT", accountType="UNIFIED")
     check_response(response)
     result = response["result"]
     if "list" in result:
@@ -165,7 +172,7 @@ def get_current_position(symbol):
     }
     params["sign"] = sign_request(params, API_SECRET)
     logger.debug("Requesting positions for {} with params: {}", symbol, params)
-    response = requests.get(url, params=params).json()
+    response = retry_request(requests.get, url, params=params).json()
     check_response(response)
     logger.debug("Position response for {}: {}", symbol, response)
     positions = response["result"].get("list", [])
@@ -194,15 +201,14 @@ def place_order(symbol, side, order_type, qty, price=None, reduce_only=False):
     try:
         logger.debug("Placing order on {}: side={}, order_type={}, qty={}, price={}, reduce_only={}",
                      symbol, side, order_type, qty, price, reduce_only)
-        response = trading_session.place_active_order(
-            symbol=symbol,
-            side=side,
-            order_type=order_type,
-            qty=qty,
-            price=price,
-            time_in_force="GoodTillCancel",
-            reduce_only=reduce_only
-        )
+        response = retry_request(trading_session.place_active_order,
+                                 symbol=symbol,
+                                 side=side,
+                                 order_type=order_type,
+                                 qty=qty,
+                                 price=price,
+                                 time_in_force="GoodTillCancel",
+                                 reduce_only=reduce_only)
         check_response(response)
         log_trade("place_order", response)
         logger.info("Order placed on {}: {}", symbol, response)
@@ -215,11 +221,10 @@ def place_order(symbol, side, order_type, qty, price=None, reduce_only=False):
 def set_trading_stop(symbol, stop_loss=None, trailing_stop=None):
     try:
         logger.debug("Setting trading stop on {}: SL={}, trailing_stop={}", symbol, stop_loss, trailing_stop)
-        response = trading_session.set_trading_stop(
-            symbol=symbol,
-            stop_loss=stop_loss,
-            trailing_stop=trailing_stop
-        )
+        response = retry_request(trading_session.set_trading_stop,
+                                 symbol=symbol,
+                                 stop_loss=stop_loss,
+                                 trailing_stop=trailing_stop)
         check_response(response)
         log_trade("set_trading_stop", response)
         logger.info("Trading stop set on {}: {}", symbol, response)
@@ -232,10 +237,9 @@ def set_trading_stop(symbol, stop_loss=None, trailing_stop=None):
 def update_trailing_stop(symbol, new_stop_loss):
     try:
         logger.debug("Updating trailing stop on {}: new SL={}", symbol, new_stop_loss)
-        response = trading_session.set_trading_stop(
-            symbol=symbol,
-            stop_loss=new_stop_loss
-        )
+        response = retry_request(trading_session.set_trading_stop,
+                                 symbol=symbol,
+                                 stop_loss=new_stop_loss)
         check_response(response)
         log_trade("update_stop_loss", response)
         logger.info("Stop loss updated on {} to {}", symbol, new_stop_loss)
@@ -248,6 +252,39 @@ def update_trailing_stop(symbol, new_stop_loss):
 def close_position(symbol, qty):
     logger.debug("Closing position on {}: qty={}", symbol, qty)
     return place_order(symbol, side="Sell", order_type="Market", qty=qty, reduce_only=True)
+
+# Global analytics dictionary to track trade performance
+analytics = {
+    "total_trades": 0,
+    "winning_trades": 0,
+    "losing_trades": 0,
+    "total_profit": 0.0
+}
+
+def record_trade(symbol, direction, entry_price, exit_price, qty):
+    """Record a closed trade and update analytics.
+       For long trades, profit = (exit - entry)*qty.
+       For short trades, profit = (entry - exit)*qty.
+    """
+    profit = (exit_price - entry_price) * qty if direction == "long" else (entry_price - exit_price) * qty
+    analytics["total_trades"] += 1
+    if profit > 0:
+        analytics["winning_trades"] += 1
+    else:
+        analytics["losing_trades"] += 1
+    analytics["total_profit"] += profit
+    logger.info("[Analytics] Trade recorded for {}: {} trade, Entry: {}, Exit: {}, Qty: {}, Profit: {:.2f}",
+                symbol, direction, entry_price, exit_price, qty, profit)
+
+def log_analytics():
+    if analytics["total_trades"] > 0:
+        win_rate = analytics["winning_trades"] / analytics["total_trades"] * 100
+        avg_profit = analytics["total_profit"] / analytics["total_trades"]
+    else:
+        win_rate = 0
+        avg_profit = 0
+    logger.info("[Analytics] Total Trades: {}, Wins: {}, Losses: {}, Win Rate: {:.2f}%, Total Profit: {:.2f}, Average Profit: {:.2f}",
+                analytics["total_trades"], analytics["winning_trades"], analytics["losing_trades"], win_rate, analytics["total_profit"], avg_profit)
 
 def plot_signals(df, symbol):
     plt.figure(figsize=(12, 6))
@@ -263,7 +300,7 @@ def plot_signals(df, symbol):
     plt.scatter(df[df['short_exit']]['open_time'], df[df['short_exit']]['close'],
                 marker='^', color='orange', s=100, label='Short Exit')
     
-    # Draw entry signals on top; add slight vertical offset for short entry markers if needed
+    # Draw entry signals on top; add slight offset for short entry markers if needed
     plt.scatter(df[df['long_entry']]['open_time'], df[df['long_entry']]['close'],
                 marker='^', color='green', s=100, label='Long Entry')
     short_entry_offset = df[df['short_entry']]['close'] - 0.002 * df[df['short_entry']]['close']
@@ -312,8 +349,8 @@ def trade_symbol(symbol):
     
     position = get_current_position(symbol)
     
-    # If no position is open, remove pyramid info if exists
     if position is None:
+        # No open position; reset pyramid data if exists
         if symbol in pyramid_data:
             del pyramid_data[symbol]
         if (current_candle['long_entry'] and
@@ -330,7 +367,6 @@ def trade_symbol(symbol):
                 order_resp = place_order(symbol, side="Buy", order_type="Market", qty=pos_size)
                 if order_resp:
                     set_trading_stop(symbol, stop_loss=round(stop_loss_price, 4))
-                    # Initialize pyramid data
                     pyramid_data[symbol] = {'baseline': entry_price, 'count': 0}
         elif (current_candle['short_entry'] and
               current_candle['rsi'] < RSI_SHORT_THRESHOLD and
@@ -350,16 +386,14 @@ def trade_symbol(symbol):
         else:
             logger.info("[{}] No confirmed entry signal. Waiting...", symbol)
     else:
-        # Position is open; first, check pyramid logic
         pos_side = position.get("side", "")
         entry_price = float(position["entry_price"])
         pos_qty = float(position["size"])
         # Initialize pyramid data if not present
         if symbol not in pyramid_data:
             pyramid_data[symbol] = {'baseline': entry_price, 'count': 0}
-        
         if pos_side == "Buy":
-            # Pyramid logic for long: if price increases by PYRAMID_THRESHOLD from baseline
+            # Pyramid logic for long positions
             if current_price > pyramid_data[symbol]['baseline'] * (1 + PYRAMID_THRESHOLD) and pyramid_data[symbol]['count'] < PYRAMID_MAX_COUNT:
                 additional_size = calculate_position_size(current_price, current_candle['prev_10d_low'], equity) * PYRAMID_ORDER_FACTOR
                 if additional_size > 0:
@@ -368,17 +402,19 @@ def trade_symbol(symbol):
                     if order_resp:
                         pyramid_data[symbol]['baseline'] = current_price
                         pyramid_data[symbol]['count'] += 1
-            # Partial exit logic
+            # Partial exit for long positions
             if current_candle['long_exit']:
                 logger.info("[{}] Long exit signal triggered. Executing partial exit.", symbol)
-                close_position(symbol, qty=pos_qty * PARTIAL_EXIT_RATIO)
+                exit_qty = pos_qty * PARTIAL_EXIT_RATIO
+                close_position(symbol, qty=exit_qty)
+                record_trade(symbol, "long", entry_price, current_price, exit_qty)
             elif current_price > entry_price * 1.05:
                 new_sl = round(current_price * 0.98, 4)
                 update_trailing_stop(symbol, new_stop_loss=new_sl)
             else:
                 logger.info("[{}] Long position: no exit or trailing update triggered.", symbol)
         elif pos_side == "Sell":
-            # Pyramid logic for short: if price decreases by PYRAMID_THRESHOLD from baseline
+            # Pyramid logic for short positions
             if current_price < pyramid_data[symbol]['baseline'] * (1 - PYRAMID_THRESHOLD) and pyramid_data[symbol]['count'] < PYRAMID_MAX_COUNT:
                 additional_size = calculate_position_size(current_price, current_candle['prev_10d_high'], equity) * PYRAMID_ORDER_FACTOR
                 if additional_size > 0:
@@ -387,10 +423,12 @@ def trade_symbol(symbol):
                     if order_resp:
                         pyramid_data[symbol]['baseline'] = current_price
                         pyramid_data[symbol]['count'] += 1
-            # Partial exit logic
+            # Partial exit for short positions
             if current_candle['short_exit']:
                 logger.info("[{}] Short exit signal triggered. Executing partial exit.", symbol)
-                close_position(symbol, qty=pos_qty * PARTIAL_EXIT_RATIO)
+                exit_qty = pos_qty * PARTIAL_EXIT_RATIO
+                close_position(symbol, qty=exit_qty)
+                record_trade(symbol, "short", entry_price, current_price, exit_qty)
             elif current_price < entry_price * 0.95:
                 new_sl = round(current_price * 1.02, 4)
                 update_trailing_stop(symbol, new_stop_loss=new_sl)
@@ -398,6 +436,7 @@ def trade_symbol(symbol):
                 logger.info("[{}] Short position: no exit or trailing update triggered.", symbol)
         else:
             logger.warning("[{}] Unknown position side: {}", symbol, pos_side)
+    log_analytics()
 
 def turtle_trading_bot():
     while True:

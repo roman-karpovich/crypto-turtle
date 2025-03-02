@@ -1,0 +1,5 @@
+config.json
+*.log
+.DS_store
+plot_signals*
+historical_data.json

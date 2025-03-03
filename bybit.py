@@ -13,11 +13,13 @@ from loguru import logger
 
 # ------------------- CONFIGURATION -------------------
 # Ensure config.json contains {"api_key": "...", "api_secret": "..."}
-INTERVAL = 'D'              # Daily candles
-HIST_LIMIT = 200            # Number of historical bars to fetch (for live trading)
-BACKTEST_LIMIT = 1000       # Number of bars for backtesting (if available)
-RISK_PERCENT = 0.02         # Risk 2% of equity per trade
-RECV_WINDOW = 5000          # Recv window in ms
+INTERVAL = 'D'                   # Daily candles
+BACKTEST_INTERVAL = '720'        # 12-hour candles for backtesting simulation
+HIST_LIMIT = 200                 # Number of historical bars to fetch (for live trading)
+BACKTEST_LIMIT = 1000            # Number of bars for backtesting (if available)
+BACKTEST_POSITION_SIZE = 10      # Backtest position size in usd
+RISK_PERCENT = 0.9               # Risk 2% of equity per trade
+RECV_WINDOW = 5000               # Recv window in ms
 
 # Fixed confirmation thresholds
 RSI_LONG_THRESHOLD = 50
@@ -35,6 +37,10 @@ PYRAMID_ORDER_FACTOR = 0.5    # Additional order is 50% of base risk-based order
 # Volume filter parameters (if desired)
 VOL_PERIOD = 20                 # Volume moving average period
 VOL_MULTIPLIER = 1.2            # Current volume must exceed 1.2x its 20-day average
+
+# Define thresholds for volatility (ATR% values) to map leverage
+LOW_VOL_THRESHOLD = 0.005   # 0.5% ATR: lowest volatility -> highest leverage
+HIGH_VOL_THRESHOLD = 0.02   # 2% ATR: highest volatility -> lowest leverage
 
 # Symbols to trade (USDT perpetual futures)
 SYMBOLS = [
@@ -54,6 +60,15 @@ analytics = {
     "losing_trades": 0,
     "total_profit": 0.0
 }
+
+# Load API credentials from config.json
+with open('config.json') as f:
+    config = json.load(f)
+API_KEY = config['api_key']
+API_SECRET = config['api_secret']
+
+# Initialize Bybit Unified Trading session
+trading_session = TradingHTTP(testnet=False, api_key=API_KEY, api_secret=API_SECRET)
 
 # ------------------- RETRY WRAPPER -------------------
 def retry_request(func, *args, retries=3, delay=2, **kwargs):
@@ -188,14 +203,38 @@ def get_latest_price(symbol):
     logger.debug("Latest price for {}: {}", symbol, latest_price)
     return latest_price
 
-def calculate_position_size(entry_price, stop_loss_price, equity):
+# ------------------- LEVERAGE CALCULATION -------------------
+def calculate_leverage(atr_percent):
+    """
+    Calculate leverage factor (between 2x and 10x) based on the ATR percentage.
+    Lower ATR (less volatile) yields higher leverage, and higher ATR yields lower leverage.
+    """
+    min_leverage = 2
+    max_leverage = 10
+    if atr_percent <= LOW_VOL_THRESHOLD:
+        return max_leverage
+    elif atr_percent >= HIGH_VOL_THRESHOLD:
+        return min_leverage
+    else:
+        # Linearly interpolate between max_leverage and min_leverage.
+        leverage = max_leverage - ((atr_percent - LOW_VOL_THRESHOLD) / (HIGH_VOL_THRESHOLD - LOW_VOL_THRESHOLD)) * (max_leverage - min_leverage)
+        return leverage
+
+# ------------------- POSITION SIZE CALCULATION -------------------
+def calculate_position_size(entry_price, stop_loss_price, equity, leverage):
+    """
+    Calculate position size by scaling the risk amount by the leverage factor.
+    Note: Using leverage here increases the notional position while still risking a fixed percent of equity.
+    """
     risk_amount = equity * RISK_PERCENT
     risk_per_unit = abs(entry_price - stop_loss_price)
     if risk_per_unit == 0:
         return 0
-    pos_size = risk_amount / risk_per_unit
-    logger.debug("Calculated position size: {} (Risk: {}, Per Unit: {})", pos_size, risk_amount, risk_per_unit)
-    return round(pos_size, 2)
+    # Scale risk_amount by leverage to compute a larger notional exposure.
+    pos_size = (risk_amount * leverage) / risk_per_unit
+    logger.debug("Calculated position size with leverage {}x: {} (Scaled Risk: {}, Per Unit Risk: {})",
+                 leverage, pos_size, risk_amount * leverage, risk_per_unit)
+    return round(pos_size, 8)
 
 def place_order(symbol, side, order_type, qty, price=None, reduce_only=False):
     try:
@@ -308,69 +347,176 @@ def plot_signals(df, symbol):
     logger.info("Plot saved to {}", filename)
 
 # ------------------- BACKTESTING FUNCTION -------------------
+# ------------------- PLOTTING FUNCTION FOR BACKTEST -------------------
+def plot_backtest_results(symbol, df, trades):
+    import matplotlib.pyplot as plt
+
+    plt.figure(figsize=(12, 6))
+    plt.plot(df['open_time'], df['close'], label='Close Price', color='black', linewidth=1)
+    
+    # Plot each trade's entry and exit, and annotate the exit point with profit
+    for trade in trades:
+        entry_time = trade['entry_time']
+        exit_time = trade['exit_time']
+        entry_price = trade['entry_price']
+        exit_price = trade['exit_price']
+        profit = trade['profit']
+        
+        if trade['direction'] == 'long':
+            plt.scatter(entry_time, entry_price, marker='^', color='green', s=100, label='Long Entry')
+            plt.scatter(exit_time, exit_price, marker='v', color='red', s=100, label='Long Exit')
+            plt.annotate(f"Profit: {profit:.2f}", xy=(exit_time, exit_price),
+                         xytext=(exit_time, exit_price * 0.98),
+                         arrowprops=dict(arrowstyle="->", color='red'),
+                         fontsize=8, color='red')
+        elif trade['direction'] == 'short':
+            plt.scatter(entry_time, entry_price, marker='v', color='red', s=100, label='Short Entry')
+            plt.scatter(exit_time, exit_price, marker='^', color='green', s=100, label='Short Exit')
+            plt.annotate(f"Profit: {profit:.2f}", xy=(exit_time, exit_price),
+                         xytext=(exit_time, exit_price * 1.02),
+                         arrowprops=dict(arrowstyle="->", color='green'),
+                         fontsize=8, color='green')
+
+    # Remove duplicate legend entries.
+    handles, labels = plt.gca().get_legend_handles_labels()
+    unique = dict(zip(labels, handles))
+    plt.legend(unique.values(), unique.keys())
+
+    plt.title(f"Backtest Results for {symbol}")
+    plt.xlabel("Time")
+    plt.ylabel("Price")
+    plt.grid(True)
+    filename = f"backtest_results_{symbol}.png"
+    plt.savefig(filename)
+    plt.close()
+    logger.info("Backtest plot saved as {}", filename)
+
+# ------------------- BACKTESTING FUNCTION (Modified for Leverage) -------------------
 def backtest_symbol(symbol):
     logger.info("Starting backtest for {}", symbol)
-    # Use a longer historical period for backtesting
-    df = get_historical_klines(symbol, INTERVAL, limit=BACKTEST_LIMIT)
-    df = calculate_turtle_signals(df)
     
-    position = None
+    # Calculate signals on daily timeframe.
+    df_daily = get_historical_klines(symbol, INTERVAL, limit=BACKTEST_LIMIT)
+    df_daily = calculate_turtle_signals(df_daily)
+    df_daily.sort_values("open_time", inplace=True)
+    
+    # Fetch 5m data for simulation.
+    df_5m = get_historical_klines(symbol, BACKTEST_INTERVAL, limit=BACKTEST_LIMIT)
+    df_5m.sort_values("open_time", inplace=True)
+    
+    # Merge daily signals onto 5m candles.
+    daily_signal_cols = ["open_time", "prev_20d_high", "prev_10d_low", "prev_20d_low", "prev_10d_high", "rsi", "atr"]
+    df_merged = pd.merge_asof(df_5m, df_daily[daily_signal_cols],
+                              on="open_time", direction="backward")
+    
     trades = []
-    
-    # Iterate over historical data row-by-row (chronologically)
-    for idx, row in df.iterrows():
-        # Long position simulation
-        if position is None:
-            if row['long_entry'] and row['rsi'] > RSI_LONG_THRESHOLD and (row['atr']/row['close'] > FIXED_ATR_PERCENT_THRESHOLD):
-                position = {
-                    'direction': 'long',
-                    'entry_price': row['close'],
-                    'entry_time': row['open_time'],
-                    'qty': 100 / row['close']
-                }
-        else:
-            if position['direction'] == 'long' and row['long_exit']:
-                trade = {
-                    'direction': 'long',
-                    'entry_price': position['entry_price'],
-                    'exit_price': row['close'],
-                    'entry_time': position['entry_time'],
-                    'exit_time': row['open_time'],
-                    'profit': (row['close'] - position['entry_price']) * position['qty']
-                }
-                trades.append(trade)
-                position = None
+    position = None
 
-        # Short position simulation
+    for idx, row in df_merged.iterrows():
+        breakout_long     = row['prev_20d_high']
+        exit_long_thresh  = row['prev_10d_low']
+        breakout_short    = row['prev_20d_low']
+        exit_short_thresh = row['prev_10d_high']
+
+        candle_open  = row['open']
+        candle_high  = row['high']
+        candle_low   = row['low']
+        candle_close = row['close']
+        candle_time  = row['open_time']
+
+        # Use daily signal ATR and close to compute volatility.
+        atr_percent = (row['atr'] / row['close']) if row['close'] != 0 else 0.0
+        leverage = calculate_leverage(atr_percent)
+        
         if position is None:
-            if row['short_entry'] and row['rsi'] < RSI_SHORT_THRESHOLD and (row['atr']/row['close'] > FIXED_ATR_PERCENT_THRESHOLD):
-                position = {
-                    'direction': 'short',
-                    'entry_price': row['close'],
-                    'entry_time': row['open_time'],
-                    'qty': 100 / row['close']
-                }
+            # Long entry simulation:
+            if row['rsi'] > RSI_LONG_THRESHOLD and (row['atr']/row['close'] > FIXED_ATR_PERCENT_THRESHOLD):
+                if candle_open >= breakout_long:
+                    entry_price = candle_open
+                    position = {
+                        'direction': 'long',
+                        'entry_price': entry_price,
+                        'entry_time': candle_time,
+                        'qty': calculate_position_size(entry_price, exit_long_thresh, BACKTEST_POSITION_SIZE, leverage)  # assume 100 equity for simulation
+                        # stop_loss remains from daily signals
+                        ,'stop_loss': exit_long_thresh
+                    }
+                elif candle_high >= breakout_long:
+                    entry_price = breakout_long
+                    position = {
+                        'direction': 'long',
+                        'entry_price': entry_price,
+                        'entry_time': candle_time,
+                        'qty': calculate_position_size(entry_price, exit_long_thresh, BACKTEST_POSITION_SIZE, leverage),
+                        'stop_loss': exit_long_thresh
+                    }
+            # Short entry simulation:
+            if position is None and row['rsi'] < RSI_SHORT_THRESHOLD and (row['atr']/row['close'] > FIXED_ATR_PERCENT_THRESHOLD):
+                if candle_open <= breakout_short:
+                    entry_price = candle_open
+                    position = {
+                        'direction': 'short',
+                        'entry_price': entry_price,
+                        'entry_time': candle_time,
+                        'qty': calculate_position_size(entry_price, exit_short_thresh, BACKTEST_POSITION_SIZE, leverage),
+                        'stop_loss': exit_short_thresh
+                    }
+                elif candle_low <= breakout_short:
+                    entry_price = breakout_short
+                    position = {
+                        'direction': 'short',
+                        'entry_price': entry_price,
+                        'entry_time': candle_time,
+                        'qty': calculate_position_size(entry_price, exit_short_thresh, BACKTEST_POSITION_SIZE, leverage),
+                        'stop_loss': exit_short_thresh
+                    }
         else:
-            if position['direction'] == 'short' and row['short_exit']:
-                trade = {
-                    'direction': 'short',
-                    'entry_price': position['entry_price'],
-                    'exit_price': row['close'],
-                    'entry_time': position['entry_time'],
-                    'exit_time': row['open_time'],
-                    'profit': (position['entry_price'] - row['close']) * position['qty']
-                }
-                trades.append(trade)
-                position = None
+            if position['direction'] == 'long':
+                exit_price = None
+                if candle_low <= position['stop_loss']:
+                    exit_price = position['stop_loss']
+                elif candle_close < exit_long_thresh:
+                    exit_price = candle_close
+                if exit_price is not None:
+                    trade = {
+                        'direction': 'long',
+                        'entry_price': position['entry_price'],
+                        'exit_price': exit_price,
+                        'entry_time': position['entry_time'],
+                        'exit_time': candle_time,
+                        'profit': (exit_price - position['entry_price']) * position['qty']
+                    }
+                    trades.append(trade)
+                    position = None
+
+            elif position['direction'] == 'short':
+                exit_price = None
+                if candle_high >= position['stop_loss']:
+                    exit_price = position['stop_loss']
+                elif candle_close > exit_short_thresh:
+                    exit_price = candle_close
+                if exit_price is not None:
+                    trade = {
+                        'direction': 'short',
+                        'entry_price': position['entry_price'],
+                        'exit_price': exit_price,
+                        'entry_time': position['entry_time'],
+                        'exit_time': candle_time,
+                        'profit': (position['entry_price'] - exit_price) * position['qty']
+                    }
+                    trades.append(trade)
+                    position = None
 
     total_trades = len(trades)
-    total_profit = sum([trade['profit'] for trade in trades])
+    total_profit = sum(trade['profit'] for trade in trades)
     wins = [trade for trade in trades if trade['profit'] > 0]
     win_rate = (len(wins) / total_trades * 100) if total_trades > 0 else 0
     avg_profit = total_profit / total_trades if total_trades > 0 else 0
 
     logger.info("[Backtest] {}: Total Trades: {}, Win Rate: {:.2f}%, Total Profit: {:.2f}, Average Profit: {:.2f}".format(
         symbol, total_trades, win_rate, total_profit, avg_profit))
+    
+    plot_backtest_results(symbol, df_merged, trades)
     return trades
 
 # ------------------- LIVE TRADING FUNCTION -------------------
@@ -396,7 +542,11 @@ def trade_symbol(symbol):
     equity = get_wallet_equity()
     atr_percent = (current_candle['atr'] / current_candle['close']) if current_candle['close'] != 0 else 0.0
 
-    # Adaptive ATR threshold: average ATR% over last 14 bars vs. fixed threshold
+    # Calculate dynamic leverage based on ATR% volatility.
+    leverage = calculate_leverage(atr_percent)
+    logger.info("[{}] Current ATR%: {:.2%} | Using leverage: {}x", symbol, atr_percent, round(leverage,2))
+    
+    # Adaptive ATR threshold remains as before.
     recent_atr_percent = df.iloc[-14:]['atr'].mean() / df.iloc[-14:]['close'].mean()
     adaptive_atr_threshold = max(FIXED_ATR_PERCENT_THRESHOLD, recent_atr_percent)
     
@@ -409,32 +559,30 @@ def trade_symbol(symbol):
     if position is None:
         if symbol in pyramid_data:
             del pyramid_data[symbol]
-        if (current_candle['long_entry'] and
-            current_candle['rsi'] > RSI_LONG_THRESHOLD and
-            atr_percent > adaptive_atr_threshold):
+        # Long Entry Signal
+        if (current_candle['long_entry'] and current_candle['rsi'] > RSI_LONG_THRESHOLD and atr_percent > adaptive_atr_threshold):
             logger.info("[{}] Confirmed LONG entry signal.", symbol)
             stop_loss_price = current_candle['prev_10d_low']
             entry_price = current_price
-            pos_size = calculate_position_size(entry_price, stop_loss_price, equity)
+            pos_size = calculate_position_size(entry_price, stop_loss_price, equity, leverage)
             if pos_size <= 0:
                 logger.warning("[{}] Long pos_size <= 0, skipping entry.", symbol)
             else:
-                logger.info("[{}] LONG size: {} (Entry: {}, Stop: {})", symbol, pos_size, entry_price, stop_loss_price)
+                logger.info("[{}] LONG size: {} (Entry: {}, Stop: {}, Leverage: {}x)", symbol, pos_size, entry_price, stop_loss_price, round(leverage,2))
                 order_resp = place_order(symbol, side="Buy", order_type="Market", qty=pos_size)
                 if order_resp:
                     set_trading_stop(symbol, stop_loss=round(stop_loss_price, 4))
                     pyramid_data[symbol] = {'baseline': entry_price, 'count': 0}
-        elif (current_candle['short_entry'] and
-              current_candle['rsi'] < RSI_SHORT_THRESHOLD and
-              atr_percent > adaptive_atr_threshold):
+        # Short Entry Signal
+        elif (current_candle['short_entry'] and current_candle['rsi'] < RSI_SHORT_THRESHOLD and atr_percent > adaptive_atr_threshold):
             logger.info("[{}] Confirmed SHORT entry signal.", symbol)
             stop_loss_price = current_candle['prev_10d_high']
             entry_price = current_price
-            pos_size = calculate_position_size(entry_price, stop_loss_price, equity)
+            pos_size = calculate_position_size(entry_price, stop_loss_price, equity, leverage)
             if pos_size <= 0:
                 logger.warning("[{}] Short pos_size <= 0, skipping entry.", symbol)
             else:
-                logger.info("[{}] SHORT size: {} (Entry: {}, Stop: {})", symbol, pos_size, entry_price, stop_loss_price)
+                logger.info("[{}] SHORT size: {} (Entry: {}, Stop: {}, Leverage: {}x)", symbol, pos_size, entry_price, stop_loss_price, round(leverage,2))
                 order_resp = place_order(symbol, side="Sell", order_type="Market", qty=pos_size)
                 if order_resp:
                     set_trading_stop(symbol, stop_loss=round(stop_loss_price, 4))
@@ -454,7 +602,7 @@ def trade_symbol(symbol):
                 close_position(symbol, qty=exit_qty)
                 record_trade(symbol, "long", entry_price, current_price, exit_qty)
             elif current_price > pyramid_data[symbol]['baseline'] * (1 + PYRAMID_THRESHOLD) and pyramid_data[symbol]['count'] < PYRAMID_MAX_COUNT:
-                additional_size = calculate_position_size(current_price, current_candle['prev_10d_low'], equity) * PYRAMID_ORDER_FACTOR
+                additional_size = calculate_position_size(current_price, current_candle['prev_10d_low'], equity, leverage) * PYRAMID_ORDER_FACTOR
                 if additional_size > 0:
                     logger.info("[{}] Pyramid condition met for LONG. Adding additional order of size: {}", symbol, additional_size)
                     order_resp = place_order(symbol, side="Buy", order_type="Market", qty=additional_size)
@@ -473,7 +621,7 @@ def trade_symbol(symbol):
                 close_position(symbol, qty=exit_qty)
                 record_trade(symbol, "short", entry_price, current_price, exit_qty)
             elif current_price < pyramid_data[symbol]['baseline'] * (1 - PYRAMID_THRESHOLD) and pyramid_data[symbol]['count'] < PYRAMID_MAX_COUNT:
-                additional_size = calculate_position_size(current_price, current_candle['prev_10d_high'], equity) * PYRAMID_ORDER_FACTOR
+                additional_size = calculate_position_size(current_price, current_candle['prev_10d_high'], equity, leverage) * PYRAMID_ORDER_FACTOR
                 if additional_size > 0:
                     logger.info("[{}] Pyramid condition met for SHORT. Adding additional order of size: {}", symbol, additional_size)
                     order_resp = place_order(symbol, side="Sell", order_type="Market", qty=additional_size)
@@ -512,7 +660,7 @@ if __name__ == '__main__':
     # Parse command-line arguments
     parser = argparse.ArgumentParser(description="Trading Strategy Script with Verbose Logging Option")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable debug/verbose logging")
-    parser.add_argument("backtest", action="store", help="Enable backtest")
+    parser.add_argument("-b", "--backtest", action="store_true", help="Enable backtest")
     args = parser.parse_args()
 
     # Configure logging level based on the verbose flag.

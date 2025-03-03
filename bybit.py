@@ -13,13 +13,13 @@ from loguru import logger
 
 # ------------------- CONFIGURATION -------------------
 # Ensure config.json contains {"api_key": "...", "api_secret": "..."}
-INTERVAL = 'D'                   # Daily candles
-BACKTEST_INTERVAL = '60'         # 1-hour candles for backtesting simulation
-HIST_LIMIT = 200                 # Number of historical bars to fetch (for live trading)
-BACKTEST_LIMIT = 2000            # Number of days for backtesting (if available)
-BACKTEST_POSITION_SIZE = 10      # Backtest position size in usd
-RISK_PERCENT = 0.9               # Risk 2% of equity per trade
-RECV_WINDOW = 5000               # Recv window in ms
+INTERVAL = 'D'  # Daily candles
+BACKTEST_INTERVAL = '60'  # 1-hour candles for backtesting simulation
+HIST_LIMIT = 200  # Number of historical bars to fetch (for live trading)
+BACKTEST_LIMIT = 2000  # Number of days for backtesting (if available)
+BACKTEST_POSITION_SIZE = 10  # Backtest position size in usd
+RISK_PERCENT = 0.9  # Risk 2% of equity per trade
+RECV_WINDOW = 5000  # Recv window in ms
 
 # Fixed confirmation thresholds
 RSI_LONG_THRESHOLD = 50
@@ -30,17 +30,20 @@ FIXED_ATR_PERCENT_THRESHOLD = 0.005  # 0.5% of price
 PARTIAL_EXIT_RATIO = 0.5
 
 # Pyramid parameters
-PYRAMID_THRESHOLD = 0.03      # 3% favorable move required to add on
-PYRAMID_MAX_COUNT = 3         # Maximum additional orders per position
-PYRAMID_ORDER_FACTOR = 0.5    # Additional order is 50% of base risk-based order size
+PYRAMID_THRESHOLD = 0.03  # 3% favorable move required to add on
+PYRAMID_MAX_COUNT = 3  # Maximum additional orders per position
+PYRAMID_ORDER_FACTOR = 0.5  # Additional order is 50% of base risk-based order size
 
 # Volume filter parameters (if desired)
-VOL_PERIOD = 20                 # Volume moving average period
-VOL_MULTIPLIER = 1.2            # Current volume must exceed 1.2x its 20-day average
+VOL_PERIOD = 20  # Volume moving average period
+VOL_MULTIPLIER = 1.2  # Current volume must exceed 1.2x its 20-day average
 
 # Define thresholds for volatility (ATR% values) to map leverage
-LOW_VOL_THRESHOLD = 0.01   # 1% ATR or lower -> highest leverage
+LOW_VOL_THRESHOLD = 0.01  # 1% ATR or lower -> highest leverage
 HIGH_VOL_THRESHOLD = 0.05  # 5% ATR or higher -> lowest leverage
+
+# Maintenance Margin (for liquidation checks in backtest)
+MAINTENANCE_MARGIN = 0.05  # Default is 5%
 
 # Symbols to trade (USDT perpetual futures)
 SYMBOLS = [
@@ -70,15 +73,17 @@ API_SECRET = config['api_secret']
 # Initialize Bybit Unified Trading session
 trading_session = TradingHTTP(testnet=False, api_key=API_KEY, api_secret=API_SECRET)
 
+
 # ------------------- RETRY WRAPPER -------------------
 def retry_request(func, *args, retries=3, delay=2, **kwargs):
     for i in range(retries):
         try:
             return func(*args, **kwargs)
         except Exception as e:
-            logger.warning("Error in {}: {}. Retry {}/{}".format(func.__name__, e, i+1, retries))
+            logger.warning("Error in {}: {}. Retry {}/{}".format(func.__name__, e, i + 1, retries))
             time.sleep(delay * (2 ** i))
     raise Exception("Function {} failed after {} retries.".format(func.__name__, retries))
+
 
 # ------------------- API FUNCTIONS -------------------
 def sign_request(params, api_secret):
@@ -88,6 +93,7 @@ def sign_request(params, api_secret):
                     param_str.encode('utf-8'),
                     hashlib.sha256).hexdigest()
 
+
 def check_response(response):
     ret_code = response.get("ret_code", response.get("retCode", None))
     if ret_code is None:
@@ -96,8 +102,10 @@ def check_response(response):
         ret_msg = response.get("ret_msg", response.get("retMsg", ""))
         raise Exception(ret_msg)
 
+
 def log_trade(action, details):
     logger.info("Action: {} - Details: {}", action, details)
+
 
 def get_historical_klines(symbol, interval, limit=HIST_LIMIT):
     url = "https://api.bybit.com/v5/market/kline"
@@ -119,7 +127,7 @@ def get_historical_klines(symbol, interval, limit=HIST_LIMIT):
         logger.debug("Requesting klines for {} with params: {}", symbol, params)
         response = retry_request(requests.get, url, params=params).json()
         check_response(response)
-        
+
         data = response["result"]["list"]
         if not data:
             logger.warning("No more historical data found for {}.", symbol)
@@ -165,19 +173,21 @@ def get_historical_klines(symbol, interval, limit=HIST_LIMIT):
     df.sort_values("open_time", inplace=True)
     df.drop_duplicates(subset="open_time", keep="first", inplace=True)  # Ensure no duplicate rows
     df.reset_index(drop=True, inplace=True)
-    
+
     logger.debug("Fetched {} klines for {} (chronological):\n{}", len(df), symbol, df.tail())
 
     return df
 
+
 def compute_atr(df, period=14):
     df['prev_close'] = df['close'].shift(1)
     df['tr'] = df.apply(lambda row: max(row['high'] - row['low'],
-                                          abs(row['high'] - row['prev_close']),
-                                          abs(row['low'] - row['prev_close'])), axis=1)
+                                        abs(row['high'] - row['prev_close']),
+                                        abs(row['low'] - row['prev_close'])), axis=1)
     df['atr'] = df['tr'].rolling(window=period).mean()
     df.drop(['prev_close', 'tr'], axis=1, inplace=True)
     return df
+
 
 def compute_rsi(df, period=14):
     delta = df['close'].diff()
@@ -189,28 +199,30 @@ def compute_rsi(df, period=14):
     df['rsi'] = 100 - (100 / (1 + rs))
     return df
 
+
 def calculate_turtle_signals(df):
     df['20d_high'] = df['high'].rolling(window=20).max()
-    df['20d_low']  = df['low'].rolling(window=20).min()
+    df['20d_low'] = df['low'].rolling(window=20).min()
     df['10d_high'] = df['high'].rolling(window=10).max()
-    df['10d_low']  = df['low'].rolling(window=10).min()
+    df['10d_low'] = df['low'].rolling(window=10).min()
     df['prev_20d_high'] = df['20d_high'].shift(1)
-    df['prev_20d_low']  = df['20d_low'].shift(1)
+    df['prev_20d_low'] = df['20d_low'].shift(1)
     df['prev_10d_high'] = df['10d_high'].shift(1)
-    df['prev_10d_low']  = df['10d_low'].shift(1)
-    
-    df['long_entry']  = df['close'] > df['prev_20d_high']
-    df['long_exit']   = df['close'] < df['prev_10d_low']
+    df['prev_10d_low'] = df['10d_low'].shift(1)
+
+    df['long_entry'] = df['close'] > df['prev_20d_high']
+    df['long_exit'] = df['close'] < df['prev_10d_low']
     df['short_entry'] = df['close'] < df['prev_20d_low']
-    df['short_exit']  = df['close'] > df['prev_10d_high']
-    
+    df['short_exit'] = df['close'] > df['prev_10d_high']
+
     df = compute_atr(df.copy(), period=14)
     df = compute_rsi(df.copy(), period=14)
-    
+
     df['vol_avg'] = df['volume'].rolling(window=VOL_PERIOD).mean()
     df['vol_confirm'] = df['volume'] > (VOL_MULTIPLIER * df['vol_avg'])
-    
+
     return df
+
 
 def get_wallet_equity():
     response = retry_request(trading_session.get_wallet_balance, coin="USDT", accountType="UNIFIED")
@@ -223,6 +235,7 @@ def get_wallet_equity():
                     if coin_info.get("coin") == "USDT":
                         return float(coin_info["equity"])
     raise Exception("USDT not found in wallet balance response.")
+
 
 def get_current_position(symbol):
     url = "https://api.bybit.com/v5/position/list"
@@ -247,11 +260,13 @@ def get_current_position(symbol):
             return pos
     return None
 
+
 def get_latest_price(symbol):
     df = get_historical_klines(symbol, INTERVAL, limit=1)
     latest_price = float(df.iloc[-1]['close'])
     logger.debug("Latest price for {}: {}", symbol, latest_price)
     return latest_price
+
 
 # ------------------- LEVERAGE CALCULATION -------------------
 def calculate_leverage(atr_percent):
@@ -261,7 +276,7 @@ def calculate_leverage(atr_percent):
     """
     min_leverage = 1
     max_leverage = 20
-    
+
     if atr_percent <= LOW_VOL_THRESHOLD:
         return max_leverage  # 20x
     elif atr_percent >= HIGH_VOL_THRESHOLD:
@@ -271,6 +286,7 @@ def calculate_leverage(atr_percent):
         ratio = (atr_percent - LOW_VOL_THRESHOLD) / (HIGH_VOL_THRESHOLD - LOW_VOL_THRESHOLD)
         # ratio goes from 0.0 to 1.0 as atr_percent goes from LOW_VOL_THRESHOLD to HIGH_VOL_THRESHOLD
         return max_leverage - (ratio * (max_leverage - min_leverage))
+
 
 # ------------------- POSITION SIZE CALCULATION -------------------
 def calculate_position_size(entry_price, stop_loss_price, equity, leverage):
@@ -287,6 +303,7 @@ def calculate_position_size(entry_price, stop_loss_price, equity, leverage):
     logger.debug("Calculated position size with leverage {}x: {} (Scaled Risk: {}, Per Unit Risk: {})",
                  leverage, pos_size, risk_amount * leverage, risk_per_unit)
     return round(pos_size, 8)
+
 
 def place_order(symbol, side, order_type, qty, price=None, reduce_only=False):
     try:
@@ -310,6 +327,7 @@ def place_order(symbol, side, order_type, qty, price=None, reduce_only=False):
         log_trade("order_error", str(e))
         return None
 
+
 def set_trading_stop(symbol, stop_loss=None, trailing_stop=None):
     try:
         logger.debug("Setting trading stop on {}: SL={}, trailing_stop={}", symbol, stop_loss, trailing_stop)
@@ -326,6 +344,7 @@ def set_trading_stop(symbol, stop_loss=None, trailing_stop=None):
         log_trade("trading_stop_error", str(e))
         return None
 
+
 def update_trailing_stop(symbol, new_stop_loss):
     try:
         logger.debug("Updating trailing stop on {}: new SL={}", symbol, new_stop_loss)
@@ -341,9 +360,11 @@ def update_trailing_stop(symbol, new_stop_loss):
         log_trade("update_stop_loss_error", str(e))
         return None
 
+
 def close_position(symbol, qty):
     logger.debug("Closing position on {}: qty={}", symbol, qty)
     return place_order(symbol, side="Sell", order_type="Market", qty=qty, reduce_only=True)
+
 
 # ------------------- ANALYTICS FUNCTIONS -------------------
 def record_trade(symbol, direction, entry_price, exit_price, qty):
@@ -357,6 +378,7 @@ def record_trade(symbol, direction, entry_price, exit_price, qty):
     logger.info("[Analytics] Trade recorded for {}: {} trade, Entry: {}, Exit: {}, Qty: {}, Profit: {:.2f}",
                 symbol, direction, entry_price, exit_price, qty, profit)
 
+
 def log_analytics():
     if analytics["total_trades"] > 0:
         win_rate = analytics["winning_trades"] / analytics["total_trades"] * 100
@@ -364,8 +386,11 @@ def log_analytics():
     else:
         win_rate = 0
         avg_profit = 0
-    logger.info("[Analytics] Total Trades: {}, Wins: {}, Losses: {}, Win Rate: {:.2f}%, Total Profit: {:.2f}, Average Profit: {:.2f}",
-                analytics["total_trades"], analytics["winning_trades"], analytics["losing_trades"], win_rate, analytics["total_profit"], avg_profit)
+    logger.info(
+        "[Analytics] Total Trades: {}, Wins: {}, Losses: {}, Win Rate: {:.2f}%, Total Profit: {:.2f}, Average Profit: {:.2f}",
+        analytics["total_trades"], analytics["winning_trades"], analytics["losing_trades"], win_rate,
+        analytics["total_profit"], avg_profit)
+
 
 # ------------------- PLOTTING FUNCTION -------------------
 def plot_signals(df, symbol):
@@ -381,7 +406,7 @@ def plot_signals(df, symbol):
                 marker='v', color='red', s=100, label='Long Exit')
     plt.scatter(df[df['short_exit']]['open_time'], df[df['short_exit']]['close'],
                 marker='^', color='orange', s=100, label='Short Exit')
-    
+
     # Draw entry signals on top; add slight offset for short entry markers if needed
     plt.scatter(df[df['long_entry']]['open_time'], df[df['long_entry']]['close'],
                 marker='^', color='green', s=100, label='Long Entry')
@@ -394,10 +419,11 @@ def plot_signals(df, symbol):
     plt.ylabel("Price")
     plt.legend()
     plt.grid(True)
-    filename = f"plot_signals_{symbol}.png"
+    filename = f"plot_signals/{symbol}.png"
     plt.savefig(filename)
     plt.close()
     logger.info("Plot saved to {}", filename)
+
 
 # ------------------- BACKTESTING FUNCTION -------------------
 # ------------------- PLOTTING FUNCTION FOR BACKTEST -------------------
@@ -406,7 +432,7 @@ def plot_backtest_results(symbol, df, trades):
 
     plt.figure(figsize=(12, 6))
     plt.plot(df['open_time'], df['close'], label='Close Price', color='black', linewidth=1)
-    
+
     # Plot each trade's entry and exit, and annotate the exit point with profit
     for trade in trades:
         entry_time = trade['entry_time']
@@ -414,7 +440,7 @@ def plot_backtest_results(symbol, df, trades):
         entry_price = trade['entry_price']
         exit_price = trade['exit_price']
         profit = trade['profit']
-        
+
         if trade['direction'] == 'long':
             plt.scatter(entry_time, entry_price, marker='^', color='green', s=100, label='Long Entry')
             plt.scatter(exit_time, exit_price, marker='v', color='red', s=100, label='Long Exit')
@@ -439,138 +465,240 @@ def plot_backtest_results(symbol, df, trades):
     plt.xlabel("Time")
     plt.ylabel("Price")
     plt.grid(True)
-    filename = f"backtest_results_{symbol}.png"
+    filename = f"backtest_results/{symbol}.png"
     plt.savefig(filename)
     plt.close()
     logger.info("Backtest plot saved as {}", filename)
 
-# ------------------- BACKTESTING FUNCTION (Modified for Leverage) -------------------
+
+def compute_liquidation_price_long(entry_price, leverage):
+    # Simplified: if price drops enough that we lose (1 - MAINTENANCE_MARGIN) of our margin
+    # margin fraction = 1 / leverage. So if price moves down by that fraction (minus maintenance margin), liquidate.
+    # price < entry_price * (1 - (1/leverage)*(1 - MAINTENANCE_MARGIN)) => liquidation
+    return entry_price * (1 - (1 / leverage) * (1 - MAINTENANCE_MARGIN))
+
+
+def compute_liquidation_price_short(entry_price, leverage):
+    # For short, if price rises enough that we lose (1 - MAINTENANCE_MARGIN) of margin => liquidation
+    # price > entry_price + (entry_price*(1/leverage)*(1 - MAINTENANCE_MARGIN)) => liquidation
+    return entry_price * (1 + (1 / leverage) * (1 - MAINTENANCE_MARGIN))
+
+
+# ------------------- BACKTESTING FUNCTION (Improved) -------------------
 def backtest_symbol(symbol):
     logger.info("Starting backtest for {}", symbol)
-    
-    # Calculate signals on daily timeframe.
+
     df_daily = get_historical_klines(symbol, INTERVAL, limit=BACKTEST_LIMIT)
     df_daily = calculate_turtle_signals(df_daily)
     df_daily.sort_values("open_time", inplace=True)
-    
-    # Fetch 5m data for simulation.
+
     df_5m = get_historical_klines(symbol, BACKTEST_INTERVAL, limit=BACKTEST_LIMIT * 24)
     df_5m.sort_values("open_time", inplace=True)
-    
-    # Merge daily signals onto 5m candles.
-    daily_signal_cols = ["open_time", "prev_20d_high", "prev_10d_low", "prev_20d_low", "prev_10d_high", "rsi", "atr"]
-    df_merged = pd.merge_asof(df_5m, df_daily[daily_signal_cols],
-                              on="open_time", direction="backward")
-    
+
+    daily_signal_cols = ["open_time", "prev_20d_high", "prev_10d_low", "prev_20d_low", "prev_10d_high", "rsi", "atr",
+                         "long_entry", "short_entry", "long_exit", "short_exit"]
+    df_merged = pd.merge_asof(df_5m, df_daily[daily_signal_cols], on="open_time", direction="backward")
+
     trades = []
     position = None
 
     for idx, row in df_merged.iterrows():
-        breakout_long     = row['prev_20d_high']
-        exit_long_thresh  = row['prev_10d_low']
-        breakout_short    = row['prev_20d_low']
-        exit_short_thresh = row['prev_10d_high']
-
-        candle_open  = row['open']
-        candle_high  = row['high']
-        candle_low   = row['low']
+        # Candle info
+        candle_open = row['open']
+        candle_high = row['high']
+        candle_low = row['low']
         candle_close = row['close']
-        candle_time  = row['open_time']
+        candle_time = row['open_time']
+        # worst-case average mid price
+        candle_mid = (candle_high + candle_low) / 2 if (candle_high and candle_low) else candle_close
 
-        # Use daily signal ATR and close to compute volatility.
-        atr_percent = (row['atr'] / row['close']) if row['close'] != 0 else 0.0
+        # daily signals
+        breakout_long = row['prev_20d_high']
+        exit_long_thresh = row['prev_10d_low']
+        breakout_short = row['prev_20d_low']
+        exit_short_thresh = row['prev_10d_high']
+        rsi = row['rsi']
+        atr = row['atr']
+
+        if pd.isna(atr) or candle_open == 0:
+            # skip incomplete data
+            continue
+
+        atr_percent = atr / candle_close if candle_close != 0 else 0.0
         leverage = calculate_leverage(atr_percent)
-        
+
+        # Define the path for worst-case price movement in this candle
         if position is None:
-            # Long entry simulation:
-            if row['rsi'] > RSI_LONG_THRESHOLD and (row['atr']/row['close'] > FIXED_ATR_PERCENT_THRESHOLD):
+            # Evaluate entry signals
+            # 1) Potential LONG
+            if (
+                    row['long_entry'] and
+                    rsi > RSI_LONG_THRESHOLD and
+                    (atr_percent > FIXED_ATR_PERCENT_THRESHOLD)
+            ):
+                # We see if candle hits breakout_long in a worst-case sequence: open -> low -> mid -> high -> close
+                # If the breakout occurs at or below the high, we can assume an entry at breakout_long
+                # We'll do a simplified check if candle_open >= breakout_long or if candle_high >= breakout_long
                 if candle_open >= breakout_long:
                     entry_price = candle_open
-                    position = {
-                        'direction': 'long',
-                        'entry_price': entry_price,
-                        'entry_time': candle_time,
-                        'qty': calculate_position_size(entry_price, exit_long_thresh, BACKTEST_POSITION_SIZE, leverage)  # assume 100 equity for simulation
-                        # stop_loss remains from daily signals
-                        ,'stop_loss': exit_long_thresh
-                    }
                 elif candle_high >= breakout_long:
                     entry_price = breakout_long
-                    position = {
-                        'direction': 'long',
-                        'entry_price': entry_price,
-                        'entry_time': candle_time,
-                        'qty': calculate_position_size(entry_price, exit_long_thresh, BACKTEST_POSITION_SIZE, leverage),
-                        'stop_loss': exit_long_thresh
-                    }
-            # Short entry simulation:
-            if position is None and row['rsi'] < RSI_SHORT_THRESHOLD and (row['atr']/row['close'] > FIXED_ATR_PERCENT_THRESHOLD):
+                else:
+                    entry_price = None
+
+                if entry_price is not None:
+                    stop_loss_price = exit_long_thresh
+                    qty = calculate_position_size(entry_price, stop_loss_price, BACKTEST_POSITION_SIZE, leverage)
+                    if qty > 0:
+                        position = {
+                            'direction': 'long',
+                            'entry_price': entry_price,
+                            'entry_time': candle_time,
+                            'qty': qty,
+                            'stop_loss': stop_loss_price,
+                            'liquidation_price': compute_liquidation_price_long(entry_price, leverage)
+                        }
+            # 2) Potential SHORT
+            if (position is None and
+                    row['short_entry'] and
+                    rsi < RSI_SHORT_THRESHOLD and
+                    (atr_percent > FIXED_ATR_PERCENT_THRESHOLD)
+            ):
                 if candle_open <= breakout_short:
                     entry_price = candle_open
-                    position = {
-                        'direction': 'short',
-                        'entry_price': entry_price,
-                        'entry_time': candle_time,
-                        'qty': calculate_position_size(entry_price, exit_short_thresh, BACKTEST_POSITION_SIZE, leverage),
-                        'stop_loss': exit_short_thresh
-                    }
                 elif candle_low <= breakout_short:
                     entry_price = breakout_short
-                    position = {
-                        'direction': 'short',
-                        'entry_price': entry_price,
-                        'entry_time': candle_time,
-                        'qty': calculate_position_size(entry_price, exit_short_thresh, BACKTEST_POSITION_SIZE, leverage),
-                        'stop_loss': exit_short_thresh
-                    }
-        else:
-            if position['direction'] == 'long':
-                exit_price = None
-                if candle_low <= position['stop_loss']:
-                    exit_price = position['stop_loss']
-                elif candle_close < exit_long_thresh:
-                    exit_price = candle_close
-                if exit_price is not None:
-                    trade = {
-                        'direction': 'long',
-                        'entry_price': position['entry_price'],
-                        'exit_price': exit_price,
-                        'entry_time': position['entry_time'],
-                        'exit_time': candle_time,
-                        'profit': (exit_price - position['entry_price']) * position['qty']
-                    }
-                    trades.append(trade)
-                    position = None
+                else:
+                    entry_price = None
 
-            elif position['direction'] == 'short':
-                exit_price = None
-                if candle_high >= position['stop_loss']:
-                    exit_price = position['stop_loss']
-                elif candle_close > exit_short_thresh:
-                    exit_price = candle_close
-                if exit_price is not None:
-                    trade = {
-                        'direction': 'short',
-                        'entry_price': position['entry_price'],
-                        'exit_price': exit_price,
-                        'entry_time': position['entry_time'],
-                        'exit_time': candle_time,
-                        'profit': (position['entry_price'] - exit_price) * position['qty']
-                    }
-                    trades.append(trade)
-                    position = None
+                if entry_price is not None:
+                    stop_loss_price = exit_short_thresh
+                    qty = calculate_position_size(entry_price, stop_loss_price, BACKTEST_POSITION_SIZE, leverage)
+                    if qty > 0:
+                        position = {
+                            'direction': 'short',
+                            'entry_price': entry_price,
+                            'entry_time': candle_time,
+                            'qty': qty,
+                            'stop_loss': stop_loss_price,
+                            'liquidation_price': compute_liquidation_price_short(entry_price, leverage)
+                        }
+        else:
+            # We have an open position. We'll simulate the worst-case path.
+            path = []
+            if position['direction'] == 'long':
+                path = [candle_open, candle_low, candle_mid, candle_high, candle_close]
+            else:  # short
+                path = [candle_open, candle_high, candle_mid, candle_low, candle_close]
+
+            exit_triggered = False
+
+            for step_price in path:
+                # Check liquidation first
+                if position['direction'] == 'long':
+                    if step_price <= position['liquidation_price']:
+                        # Liquidation
+                        trade = {
+                            'direction': 'long',
+                            'entry_price': position['entry_price'],
+                            'exit_price': position['liquidation_price'],
+                            'entry_time': position['entry_time'],
+                            'exit_time': candle_time,
+                            'profit': (position['liquidation_price'] - position['entry_price']) * position['qty']
+                        }
+                        trades.append(trade)
+                        position = None
+                        exit_triggered = True
+                        break
+                    # Check stop
+                    if step_price <= position['stop_loss']:
+                        trade = {
+                            'direction': 'long',
+                            'entry_price': position['entry_price'],
+                            'exit_price': position['stop_loss'],
+                            'entry_time': position['entry_time'],
+                            'exit_time': candle_time,
+                            'profit': (position['stop_loss'] - position['entry_price']) * position['qty']
+                        }
+                        trades.append(trade)
+                        position = None
+                        exit_triggered = True
+                        break
+                else:  # short
+                    if step_price >= position['liquidation_price']:
+                        # Liquidation
+                        trade = {
+                            'direction': 'short',
+                            'entry_price': position['entry_price'],
+                            'exit_price': position['liquidation_price'],
+                            'entry_time': position['entry_time'],
+                            'exit_time': candle_time,
+                            'profit': (position['entry_price'] - position['liquidation_price']) * position['qty']
+                        }
+                        trades.append(trade)
+                        position = None
+                        exit_triggered = True
+                        break
+                    # Check stop
+                    if step_price >= position['stop_loss']:
+                        trade = {
+                            'direction': 'short',
+                            'entry_price': position['entry_price'],
+                            'exit_price': position['stop_loss'],
+                            'entry_time': position['entry_time'],
+                            'exit_time': candle_time,
+                            'profit': (position['entry_price'] - position['stop_loss']) * position['qty']
+                        }
+                        trades.append(trade)
+                        position = None
+                        exit_triggered = True
+                        break
+
+            # If still in position after path, check if daily signal says exit
+            if not exit_triggered and position is not None:
+                if position['direction'] == 'long':
+                    # daily exit signal
+                    if row['long_exit']:
+                        # close at candle_close
+                        trade = {
+                            'direction': 'long',
+                            'entry_price': position['entry_price'],
+                            'exit_price': candle_close,
+                            'entry_time': position['entry_time'],
+                            'exit_time': candle_time,
+                            'profit': (candle_close - position['entry_price']) * position['qty']
+                        }
+                        trades.append(trade)
+                        position = None
+                else:
+                    if row['short_exit']:
+                        trade = {
+                            'direction': 'short',
+                            'entry_price': position['entry_price'],
+                            'exit_price': candle_close,
+                            'entry_time': position['entry_time'],
+                            'exit_time': candle_time,
+                            'profit': (position['entry_price'] - candle_close) * position['qty']
+                        }
+                        trades.append(trade)
+                        position = None
+
+    # End of data loop, close any open position at last price? (Optional) - We'll skip unless we want forced exit.
 
     total_trades = len(trades)
-    total_profit = sum(trade['profit'] for trade in trades)
-    wins = [trade for trade in trades if trade['profit'] > 0]
+    total_profit = sum(tr['profit'] for tr in trades)
+    wins = [t for t in trades if t['profit'] > 0]
     win_rate = (len(wins) / total_trades * 100) if total_trades > 0 else 0
-    avg_profit = total_profit / total_trades if total_trades > 0 else 0
+    avg_profit = (total_profit / total_trades) if total_trades > 0 else 0
 
-    logger.info("[Backtest] {}: Total Trades: {}, Win Rate: {:.2f}%, Total Profit: {:.2f}, Average Profit: {:.2f}".format(
-        symbol, total_trades, win_rate, total_profit, avg_profit))
-    
+    logger.info(
+        "[Backtest] {}: Total Trades: {}, Win Rate: {:.2f}%, Total Profit: {:.2f}, Average Profit: {:.2f}",
+        symbol, total_trades, win_rate, total_profit, avg_profit
+    )
+
     plot_backtest_results(symbol, df_merged, trades)
     return trades
+
 
 # ------------------- LIVE TRADING FUNCTION -------------------
 def trade_symbol(symbol):
@@ -601,7 +729,7 @@ def trade_symbol(symbol):
 
     # Calculate dynamic leverage based on ATR% volatility.
     leverage = calculate_leverage(atr_percent)
-    
+
     logger.info("[{}] {} | Price: {} | Equity: {} | ATR%: {:.2%} (Adaptive: {:.2%}) | RSI: {:.2f} | Leverage: {}x",
                 symbol,
                 datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -614,13 +742,15 @@ def trade_symbol(symbol):
         if confirmed_candle['long_entry']:
             breakout_level = confirmed_candle['prev_20d_high']
             if current_price < breakout_level:
-                logger.info("[{}] Today's price ({}) has not broken out above {} for long entry. Waiting...", symbol, current_price, breakout_level)
+                logger.info("[{}] Today's price ({}) has not broken out above {} for long entry. Waiting...", symbol,
+                            current_price, breakout_level)
                 return  # Skip entry
         # For a short signal, require that today's price has reached below yesterday's breakout level.
         if confirmed_candle['short_entry']:
             breakout_level = confirmed_candle['prev_20d_low']
             if current_price > breakout_level:
-                logger.info("[{}] Today's price ({}) has not broken below {} for short entry. Waiting...", symbol, current_price, breakout_level)
+                logger.info("[{}] Today's price ({}) has not broken below {} for short entry. Waiting...", symbol,
+                            current_price, breakout_level)
                 return  # Skip entry
 
     position = get_current_position(symbol)
@@ -629,7 +759,8 @@ def trade_symbol(symbol):
         if symbol in pyramid_data:
             del pyramid_data[symbol]
         # Evaluate long entry using confirmed daily candle signals.
-        if (confirmed_candle['long_entry'] and confirmed_candle['rsi'] > RSI_LONG_THRESHOLD and atr_percent > adaptive_atr_threshold):
+        if (confirmed_candle['long_entry'] and confirmed_candle[
+            'rsi'] > RSI_LONG_THRESHOLD and atr_percent > adaptive_atr_threshold):
             logger.info("[{}] Confirmed LONG entry signal from closed candle.", symbol)
             stop_loss_price = confirmed_candle['prev_10d_low']
             entry_price = current_price
@@ -637,13 +768,15 @@ def trade_symbol(symbol):
             if pos_size <= 0:
                 logger.warning("[{}] Long pos_size <= 0, skipping entry.", symbol)
             else:
-                logger.info("[{}] LONG size: {} (Entry: {}, Stop: {}, Leverage: {}x)", symbol, pos_size, entry_price, stop_loss_price, round(leverage, 2))
+                logger.info("[{}] LONG size: {} (Entry: {}, Stop: {}, Leverage: {}x)", symbol, pos_size, entry_price,
+                            stop_loss_price, round(leverage, 2))
                 order_resp = place_order(symbol, side="Buy", order_type="Market", qty=pos_size)
                 if order_resp:
                     set_trading_stop(symbol, stop_loss=round(stop_loss_price, 4))
                     pyramid_data[symbol] = {'baseline': entry_price, 'count': 0}
         # Evaluate short entry using confirmed candle signals.
-        elif (confirmed_candle['short_entry'] and confirmed_candle['rsi'] < RSI_SHORT_THRESHOLD and atr_percent > adaptive_atr_threshold):
+        elif (confirmed_candle['short_entry'] and confirmed_candle[
+            'rsi'] < RSI_SHORT_THRESHOLD and atr_percent > adaptive_atr_threshold):
             logger.info("[{}] Confirmed SHORT entry signal from closed candle.", symbol)
             stop_loss_price = confirmed_candle['prev_10d_high']
             entry_price = current_price
@@ -651,7 +784,8 @@ def trade_symbol(symbol):
             if pos_size <= 0:
                 logger.warning("[{}] Short pos_size <= 0, skipping entry.", symbol)
             else:
-                logger.info("[{}] SHORT size: {} (Entry: {}, Stop: {}, Leverage: {}x)", symbol, pos_size, entry_price, stop_loss_price, round(leverage, 2))
+                logger.info("[{}] SHORT size: {} (Entry: {}, Stop: {}, Leverage: {}x)", symbol, pos_size, entry_price,
+                            stop_loss_price, round(leverage, 2))
                 order_resp = place_order(symbol, side="Sell", order_type="Market", qty=pos_size)
                 if order_resp:
                     set_trading_stop(symbol, stop_loss=round(stop_loss_price, 4))
@@ -671,10 +805,13 @@ def trade_symbol(symbol):
                 exit_qty = pos_qty * PARTIAL_EXIT_RATIO
                 close_position(symbol, qty=exit_qty)
                 record_trade(symbol, "long", entry_price, current_price, exit_qty)
-            elif current_price > pyramid_data[symbol]['baseline'] * (1 + PYRAMID_THRESHOLD) and pyramid_data[symbol]['count'] < PYRAMID_MAX_COUNT:
-                additional_size = calculate_position_size(current_price, confirmed_candle['prev_10d_low'], equity, leverage) * PYRAMID_ORDER_FACTOR
+            elif current_price > pyramid_data[symbol]['baseline'] * (1 + PYRAMID_THRESHOLD) and pyramid_data[symbol][
+                'count'] < PYRAMID_MAX_COUNT:
+                additional_size = calculate_position_size(current_price, confirmed_candle['prev_10d_low'], equity,
+                                                          leverage) * PYRAMID_ORDER_FACTOR
                 if additional_size > 0:
-                    logger.info("[{}] Pyramid condition met for LONG. Adding additional order of size: {}", symbol, additional_size)
+                    logger.info("[{}] Pyramid condition met for LONG. Adding additional order of size: {}", symbol,
+                                additional_size)
                     order_resp = place_order(symbol, side="Buy", order_type="Market", qty=additional_size)
                     if order_resp:
                         pyramid_data[symbol]['baseline'] = current_price
@@ -690,10 +827,13 @@ def trade_symbol(symbol):
                 exit_qty = pos_qty * PARTIAL_EXIT_RATIO
                 close_position(symbol, qty=exit_qty)
                 record_trade(symbol, "short", entry_price, current_price, exit_qty)
-            elif current_price < pyramid_data[symbol]['baseline'] * (1 - PYRAMID_THRESHOLD) and pyramid_data[symbol]['count'] < PYRAMID_MAX_COUNT:
-                additional_size = calculate_position_size(current_price, confirmed_candle['prev_10d_high'], equity, leverage) * PYRAMID_ORDER_FACTOR
+            elif current_price < pyramid_data[symbol]['baseline'] * (1 - PYRAMID_THRESHOLD) and pyramid_data[symbol][
+                'count'] < PYRAMID_MAX_COUNT:
+                additional_size = calculate_position_size(current_price, confirmed_candle['prev_10d_high'], equity,
+                                                          leverage) * PYRAMID_ORDER_FACTOR
                 if additional_size > 0:
-                    logger.info("[{}] Pyramid condition met for SHORT. Adding additional order of size: {}", symbol, additional_size)
+                    logger.info("[{}] Pyramid condition met for SHORT. Adding additional order of size: {}", symbol,
+                                additional_size)
                     order_resp = place_order(symbol, side="Sell", order_type="Market", qty=additional_size)
                     if order_resp:
                         pyramid_data[symbol]['baseline'] = current_price
@@ -707,6 +847,7 @@ def trade_symbol(symbol):
             logger.warning("[{}] Unknown position side: {}", symbol, pos_side)
     log_analytics()
 
+
 def turtle_trading_bot():
     while True:
         try:
@@ -719,12 +860,14 @@ def turtle_trading_bot():
             log_trade("bot_error", str(e))
         time.sleep(30 * 60)
 
+
 def backtest():
     # Run backtesting for each symbol
     for sym in SYMBOLS:
         backtest_symbol(sym)
         time.sleep(2)
     log_analytics()
+
 
 if __name__ == '__main__':
     # Parse command-line arguments
@@ -736,7 +879,7 @@ if __name__ == '__main__':
     # Configure logging level based on the verbose flag.
     # Remove the default Loguru handler and configure output to stderr.
     logger.remove()
-    logger.add("bot_debug.log", level="DEBUG", rotation="1 MB")
+    logger.add("logs/bot_debug.log", level="DEBUG", rotation="10 MB")
     if args.verbose:
         logger.add(sys.stderr, level="DEBUG")
         logger.debug("Verbose logging enabled.")

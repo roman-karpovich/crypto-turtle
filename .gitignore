@@ -1,6 +1,8 @@
 config.json
 *.log
 .DS_store
-plot_signals*
 historical_data.json
-signals*
+backtest_results
+plot_signals
+logs
+.idea

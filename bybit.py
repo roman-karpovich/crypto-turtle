@@ -18,7 +18,7 @@ BACKTEST_INTERVAL = '60'  # 1-hour candles for backtesting simulation
 HIST_LIMIT = 200  # Number of historical bars to fetch (for live trading)
 BACKTEST_LIMIT = 2000  # Number of days for backtesting (if available)
 BACKTEST_POSITION_SIZE = 10  # Backtest position size in usd
-RISK_PERCENT = 0.9  # Risk 2% of equity per trade
+RISK_PERCENT = 0.02  # Risk 2% of equity per trade
 RECV_WINDOW = 5000  # Recv window in ms
 
 # Fixed confirmation thresholds
